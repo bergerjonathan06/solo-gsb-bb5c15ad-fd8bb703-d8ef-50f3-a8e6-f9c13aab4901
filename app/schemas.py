@@ -10,6 +10,16 @@ from . import settings
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
+def normalize_sha256(value: str) -> str:
+    """规范化 SHA-256 摘要：去空白、转小写、允许 sha256: 前缀；格式非法抛 ValueError。"""
+    value = value.strip().lower()
+    if value.startswith("sha256:"):
+        value = value[len("sha256:"):]
+    if not _SHA256_HEX.match(value):
+        raise ValueError("sha256 must be 64 lowercase hex characters")
+    return value
+
+
 class CreateSessionRequest(BaseModel):
     filename: str = Field(..., description="原始文件名")
     total_size: int = Field(..., ge=0, description="文件总字节数")
@@ -40,12 +50,7 @@ class CreateSessionRequest(BaseModel):
     @field_validator("sha256")
     @classmethod
     def _validate_sha256(cls, value: str) -> str:
-        value = value.strip().lower()
-        if value.startswith("sha256:"):
-            value = value[len("sha256:"):]
-        if not _SHA256_HEX.match(value):
-            raise ValueError("sha256 must be 64 lowercase hex characters")
-        return value
+        return normalize_sha256(value)
 
 
 class MissingRange(BaseModel):

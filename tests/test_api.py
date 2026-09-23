@@ -247,6 +247,130 @@ def test_invalid_create_requests(client: TestClient) -> None:
     assert r.status_code == 422
 
 
+def test_chunk_sha256_header_accepted_roundtrip(client: TestClient) -> None:
+    data = bytes((i * 7 + 3) % 256 for i in range(4096))
+    sid = _create(client, data)
+    mid = 2000
+
+    # 正确摘要：大写 + sha256: 前缀也应被接受（规范化后比较）。
+    digest0 = hashlib.sha256(data[:mid]).hexdigest()
+    r = client.put(
+        f"/api/v1/sessions/{sid}/chunks?start=0&end={mid}",
+        content=data[:mid],
+        headers={"X-Chunk-SHA256": "sha256:" + digest0.upper()},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["received"] == {"start": 0, "end": mid}
+
+    r = client.put(
+        f"/api/v1/sessions/{sid}/chunks?start={mid}&end={len(data)}",
+        content=data[mid:],
+        headers={"X-Chunk-SHA256": hashlib.sha256(data[mid:]).hexdigest()},
+    )
+    assert r.status_code == 200, r.text
+
+    done = client.post(f"/api/v1/sessions/{sid}/complete")
+    assert done.status_code == 200, done.text
+    dl = client.get(f"/api/v1/sessions/{sid}/download")
+    assert dl.status_code == 200
+    assert dl.content == data
+
+
+def test_chunk_sha256_malformed_header_rejected_before_storage(
+    client: TestClient,
+) -> None:
+    data = b"0123456789" * 10
+    sid = _create(client, data)
+
+    before = client.get(f"/api/v1/sessions/{sid}").json()["last_access_at"]
+    for bad in ("not-a-hash", "a" * 63, "z" * 64, "sha256:" + "a" * 63):
+        r = client.put(
+            f"/api/v1/sessions/{sid}/chunks?start=0&end=100",
+            content=data[:100],
+            headers={"X-Chunk-SHA256": bad},
+        )
+        assert r.status_code == 400, (bad, r.status_code, r.text)
+        assert "X-Chunk-SHA256" in r.json()["detail"]["error"]
+
+    # 不落盘、不登记区间、不更新已收字节数，也不滑动 TTL。
+    status = client.get(f"/api/v1/sessions/{sid}").json()
+    assert status["bytes_received"] == 0
+    assert status["fully_received"] is False
+    assert status["missing_ranges"] == [{"start": 0, "end": len(data)}]
+    assert status["last_access_at"] == before
+    parts = storage.parts_dir(sid)
+    assert not parts.exists() or not any(parts.iterdir())
+    # 临时文件不得残留。
+    assert not list(storage.tmp_dir().glob("recv-*.part"))
+    # 不带该头仍可正常提交。
+    r = client.put(
+        f"/api/v1/sessions/{sid}/chunks?start=0&end=100", content=data[:100]
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_chunk_sha256_mismatch_not_registered_and_retry_succeeds(
+    client: TestClient,
+) -> None:
+    data = bytes((i * 13 + 1) % 256 for i in range(5000))
+    sid = _create(client, data)
+
+    # 错误摘要（用别的数据算）→ 422，带 expected/actual。
+    wrong_digest = hashlib.sha256(b"totally different bytes").hexdigest()
+    r = client.put(
+        f"/api/v1/sessions/{sid}/chunks?start=1000&end=4000",
+        content=data[1000:4000],
+        headers={"X-Chunk-SHA256": wrong_digest},
+    )
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "chunk sha256 mismatch"
+    assert detail["expected"] == wrong_digest
+    assert detail["actual"] == hashlib.sha256(data[1000:4000]).hexdigest()
+    assert detail["start"] == 1000
+    assert detail["end"] == 4000
+
+    # 不落盘、不登记区间、不计字节数，临时文件清理干净。
+    status = client.get(f"/api/v1/sessions/{sid}").json()
+    assert status["bytes_received"] == 0
+    assert status["missing_ranges"] == [{"start": 0, "end": len(data)}]
+    parts = storage.parts_dir(sid)
+    assert not parts.exists() or not any(parts.iterdir())
+    assert not list(storage.tmp_dir().glob("recv-*.part"))
+
+    # 摘要头正确但实际长度不符时以长度错误（400）为先。
+    r = client.put(
+        f"/api/v1/sessions/{sid}/chunks?start=0&end=100",
+        content=data[:50],
+        headers={"X-Chunk-SHA256": hashlib.sha256(data[:100]).hexdigest()},
+    )
+    assert r.status_code == 400
+
+    # 用正确内容重传原区间 → 成功；随后补齐并完成整文件校验。
+    r = client.put(
+        f"/api/v1/sessions/{sid}/chunks?start=1000&end=4000",
+        content=data[1000:4000],
+        headers={"X-Chunk-SHA256": hashlib.sha256(data[1000:4000]).hexdigest()},
+    )
+    assert r.status_code == 200, r.text
+    r = client.put(
+        f"/api/v1/sessions/{sid}/chunks?start=0&end=1000",
+        content=data[:1000],
+        headers={"X-Chunk-SHA256": hashlib.sha256(data[:1000]).hexdigest()},
+    )
+    assert r.status_code == 200, r.text
+    r = client.put(
+        f"/api/v1/sessions/{sid}/chunks?start=4000&end=5000",
+        content=data[4000:],
+        headers={"X-Chunk-SHA256": hashlib.sha256(data[4000:]).hexdigest()},
+    )
+    assert r.status_code == 200, r.text
+
+    done = client.post(f"/api/v1/sessions/{sid}/complete")
+    assert done.status_code == 200, done.text
+    assert client.get(f"/api/v1/sessions/{sid}/download").content == data
+
+
 def test_concurrent_overlapping_chunks_only_one_wins(client: TestClient) -> None:
     import threading
 
