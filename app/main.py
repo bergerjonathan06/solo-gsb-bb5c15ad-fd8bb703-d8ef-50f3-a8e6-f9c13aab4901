@@ -3,7 +3,7 @@
 接口概览（前缀 /api/v1）：
   POST   /sessions                      创建上传会话（可选 Idempotency-Key 幂等创建）
   GET    /sessions/{id}                 查询状态与缺失区间
-  PUT    /sessions/{id}/chunks          提交二进制分片（?start=&end=，半开区间）
+  PUT    /sessions/{id}/chunks          提交二进制分片（?start=&end=，半开区间；可选 X-Chunk-SHA256 逐片校验）
   POST   /sessions/{id}/complete        原子完成（区间全覆盖 + SHA-256 校验）
   DELETE /sessions/{id}                 放弃会话
   GET    /sessions/{id}/download        会话下载（原有接口，不计数）
@@ -394,6 +394,15 @@ async def put_chunk(
     request: Request,
     start: int = Query(..., ge=0, description="起始偏移（含）"),
     end: int = Query(..., ge=0, description="结束偏移（不含），半开区间 [start, end)"),
+    chunk_sha256: str | None = Header(
+        default=None,
+        alias="X-Chunk-SHA256",
+        description=(
+            "可选：本分片原始字节的 SHA-256（64 位十六进制，可带 sha256: 前缀）。"
+            "提供时服务端在写入分片前校验请求体长度与摘要；格式错误返回 400，"
+            "摘要不匹配返回 422，且不落盘、不登记区间，重传正确内容即可恢复。"
+        ),
+    ),
 ) -> dict:
     if end <= start:
         raise _http(
@@ -418,13 +427,28 @@ async def put_chunk(
             413, "chunk larger than MAX_CHUNK_BYTES",
             max_chunk_bytes=settings.max_chunk_bytes,
         )
+    # 头格式错误在读体之前拒绝：不消耗请求体、不滑动 TTL、不接触存储。
+    if chunk_sha256 is not None:
+        try:
+            expected_chunk_digest = schemas.normalize_sha256(chunk_sha256)
+        except ValueError:
+            raise _http(
+                400,
+                "invalid X-Chunk-SHA256 header",
+                requirement="64 lowercase hex characters, optional sha256: prefix",
+            )
+    else:
+        expected_chunk_digest = None
 
     # 首次校验 + TTL 滑动（阻塞 DB 操作丢到线程池，避免卡住事件循环）。
     await run_sync(_prepare_chunk, session_id, start, end, declared_length)
 
     # 流式落临时文件，弱网下也不会把整分片读进内存。
+    # 提供 X-Chunk-SHA256 时同步增量计算摘要：校验不过只删除临时文件，
+    # 绝不移动到分片目录、绝不登记区间，因此重传正确内容后仍可正常完成。
     tmp = storage.new_temp_file()
     received = 0
+    digest = hashlib.sha256() if expected_chunk_digest is not None else None
     try:
         with tmp.open("wb") as out:
             async for block in request.stream():
@@ -436,6 +460,8 @@ async def put_chunk(
                         declared=declared_length,
                     )
                 out.write(block)
+                if digest is not None:
+                    digest.update(block)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -448,6 +474,19 @@ async def put_chunk(
             bytes_received=received,
             expected=end - start,
         )
+
+    if digest is not None:
+        actual_chunk_digest = digest.hexdigest()
+        if actual_chunk_digest != expected_chunk_digest:
+            tmp.unlink(missing_ok=True)
+            raise _http(
+                422,
+                "chunk sha256 mismatch",
+                start=start,
+                end=end,
+                expected=expected_chunk_digest,
+                actual=actual_chunk_digest,
+            )
 
     return await run_sync(_commit_chunk, session_id, start, end, str(tmp))
 
